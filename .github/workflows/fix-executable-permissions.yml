@@ -1,0 +1,65 @@
+# ================================================
+# 機能概要
+# -----------------------------------------------
+# このワークフローは、
+# .githooks 直下のスクリプトへ実行権限（chmod +x）を付与し、
+# 変更が発生した場合のみコミットおよびプッシュを行います。
+#
+# 実行条件：
+# ・workflow_dispatch（手動実行）
+#
+# 主な処理：
+# ・リポジトリを checkout
+# ・.githooks/* と init_r.sh に対して実行権限を付与（対象なしでも処理を継続）
+# ・GitHub Actions 用の git ユーザー情報を設定
+# ・差分を判定し、変更がある場合のみコミット＆プッシュ
+# ・変更がない場合はメッセージを出力して終了
+# ================================================
+
+name: Fix Executable Permissions
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  fix-permissions:
+    runs-on: ubuntu-latest # GitHub が用意する Linux 実行環境
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set executable permissions for .githooks
+        run: |
+          # 厳格モード: エラー時は即終了
+          set -euo pipefail
+
+          chmod +x .githooks/* || true
+
+      - name: Set executable permissions for init_r.sh
+        run: |
+          # 厳格モード: エラー時は即終了
+          set -euo pipefail
+
+          chmod +x init_r.sh || true
+
+      - name: Commit and push changes if any
+        run: |
+          # 厳格モード: エラー時は即終了
+          set -euo pipefail
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          if ! git diff --quiet; then
+            git add -u
+            git commit -m "Fix executable permissions automatically"
+            git push origin "${GITHUB_REF#refs/heads/}"
+          else
+            echo "No permission changes detected."
+          fi

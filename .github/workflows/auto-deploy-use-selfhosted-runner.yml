@@ -1,0 +1,398 @@
+# ================================================
+# 機能概要
+# -----------------------------------------------
+# このワークフローは、2つのジョブで構成されます。
+# ・解析ジョブ（ubuntu-latest）でリポジトリ情報を検証
+# ・配信ジョブ（Self-Hosted）で資材を指定パスへデプロイ
+#
+# 実行条件：
+# ・workflow_call（通常は "Auto Tag Processing" から呼び出し）
+# ・workflow_dispatch（手動実行）
+#
+# 主な処理：
+# ・Custom Properties（Molecule / StudyNo）を取得
+# ・リポジトリ名とCustom Propertiesの整合性を検証し、環境情報を抽出
+# ・テンプレートパス（vars）を変数で置換し配信先を決定
+# ・.github/.deployconfig.json の設定に基づき、配信先をクリーンアップ
+# ・.github/.deployconfig.json の設定に基づき、資材を配信先へ同期（rsync）
+# ・初回配信時のみ、配送先ルートに .Rprofile.org を作成し、2回目以降は既存ファイルを保持
+# ・エラー時は即時中断し、ログはActionsで確認可能
+# ・成功時に checkout 資材とログをクリーンアップ
+# ================================================
+
+name: Auto Deploy (Self-Hosted)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+jobs:
+  analyze-repository-name:
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.parse-name.outputs.env_name }}
+      repo_type: ${{ steps.parse-name.outputs.repo_type }}
+      molecule: ${{ steps.parse-name.outputs.molecule }}
+      study_no: ${{ steps.parse-name.outputs.study_no }}
+      reporting_event: ${{ steps.parse-name.outputs.reporting_event }}
+
+    steps:
+      - name: Get Custom Properties
+        id: get-props
+        run: |
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${{ github.repository }}/properties/values")
+
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+          PROPERTIES=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to fetch custom properties. Status: $HTTP_CODE"
+            echo "Body: $PROPERTIES"
+            exit 1
+          fi
+          echo "✅ Successfully fetched custom properties."
+
+          MOLECULE=$(echo "$PROPERTIES" | jq -r '.[] | select(.property_name=="Molecule") | .value')
+          STUDY_NO=$(echo "$PROPERTIES" | jq -r '.[] | select(.property_name=="StudyNo") | .value')
+
+          echo "molecule=$MOLECULE" >> $GITHUB_OUTPUT
+          echo "study_no=$STUDY_NO" >> $GITHUB_OUTPUT
+          echo "Fetched Molecule: $MOLECULE"
+          echo "Fetched Study No: $STUDY_NO"
+
+      - name: Parse Repository Name
+        id: parse-name
+        env:
+          PROPS_MOLECULE: ${{ steps.get-props.outputs.molecule }}
+          PROPS_STUDY_NO: ${{ steps.get-props.outputs.study_no }}
+        run: |
+          # リポジトリ名からオーナー部分を削除
+          REPO_NAME=$(echo "${{ github.repository }}" | awk -F '/' '{print $2}')
+          echo "Analyzing Repository Name: $REPO_NAME"
+
+          # リポジトリ名を「-」で分割
+          IFS='-' read -r -a parts <<< "$REPO_NAME"
+          if [ "${#parts[@]}" -lt 5 ]; then
+            echo "Error: The repository name does not conform to the correct format, and the necessary information cannot be analyzed."
+            exit 1
+          fi
+
+          # 先頭3つのパーツは固定形式
+          PART1="${parts[0]}"
+          ENV_NAME="${parts[1]}"
+          REPO_TYPE="${parts[2]}"
+          echo "Part 1: $PART1, Environment: $ENV_NAME, Type: $REPO_TYPE"
+
+          if [[ "$PART1" != "AEGIS" ]]; then
+            echo "Error: The first part of the repository name must be 'AEGIS'."
+            exit 1
+          fi
+
+          if [[ "$ENV_NAME" != "DEV" && "$ENV_NAME" != "VAL" && "$ENV_NAME" != "PRD" ]]; then
+            echo "Error: The second part of the repository name must be 'DEV', 'VAL', or 'PRD'."
+            exit 1
+          fi
+
+          if [[ "$REPO_TYPE" != "S" && "$REPO_TYPE" != "M" ]]; then
+            echo "Error: The third part of the repository name must be 'S' or 'M'."
+            exit 1
+          fi
+
+          # リポジトリ名の残りの部分を取得
+          # AEGIS-ENV-TYPE- の部分を削除
+          REST_OF_NAME="${REPO_NAME#"$PART1-$ENV_NAME-$REPO_TYPE-"}"
+          echo "Initial remaining string: $REST_OF_NAME"
+
+          # 1. Moleculeの検証 (SとM共通)
+          if [ -z "$PROPS_MOLECULE" ]; then
+            echo "Error: The 'Molecule' custom property is not set or is empty."
+            exit 1
+          fi
+          echo "Verifying Molecule: $PROPS_MOLECULE"
+          if [[ ! "$REST_OF_NAME" == "$PROPS_MOLECULE-"* ]]; then
+            echo "Error: Repository name part does not match the 'Molecule' property ('$PROPS_MOLECULE')."
+            exit 1
+          fi
+          # Molecule部分を削除
+          REST_OF_NAME="${REST_OF_NAME#"$PROPS_MOLECULE-"}"
+          echo "Remaining string after stripping molecule: $REST_OF_NAME"
+
+          # 2. StudyNoの検証 (Sのみ)
+          if [ "$REPO_TYPE" == "S" ]; then
+            echo "Detected Type: S (Study). Verifying StudyNo..."
+            if [ -z "$PROPS_STUDY_NO" ]; then
+              echo "Error: The 'StudyNo' custom property is not set or is empty for a Type 'S' repository."
+              exit 1
+            fi
+            echo "Verifying StudyNo: $PROPS_STUDY_NO"
+            if [[ ! "$REST_OF_NAME" == "$PROPS_STUDY_NO-"* ]]; then
+              echo "Error: Repository name part does not match the 'StudyNo' property ('$PROPS_STUDY_NO')."
+              exit 1
+            fi
+            # StudyNo部分を削除
+            REST_OF_NAME="${REST_OF_NAME#"$PROPS_STUDY_NO-"}"
+            echo "Remaining string after stripping study_no: $REST_OF_NAME"
+          fi
+
+          # 3. 残りをReportingEventNameとする
+          REPORTING_EVENT_NAME="$REST_OF_NAME"
+          if [ -z "$REPORTING_EVENT_NAME" ]; then
+            echo "Error: ReportingEventName could not be determined from the repository name."
+            exit 1
+          fi
+          echo "✅ Repository name parsed successfully."
+
+          # 結果を出力変数に設定
+          echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+          echo "repo_type=$REPO_TYPE" >> $GITHUB_OUTPUT
+          echo "molecule=$PROPS_MOLECULE" >> $GITHUB_OUTPUT
+          echo "study_no=$PROPS_STUDY_NO" >> $GITHUB_OUTPUT
+          echo "reporting_event=$REPORTING_EVENT_NAME" >> $GITHUB_OUTPUT
+
+          echo "--- Outputs ---"
+          echo "env_name: $ENV_NAME"
+          echo "repo_type: $REPO_TYPE"
+          echo "molecule: $PROPS_MOLECULE"
+          echo "study_no: $PROPS_STUDY_NO"
+          echo "reporting_event: $REPORTING_EVENT_NAME"
+
+  deploy-on-runner:
+    needs: analyze-repository-name
+    # Self-Hosted ランナーを指定（ラベルは環境に合わせて調整してください）
+    # Labels are case-insensitive. Ensure they match the labels assigned to your self-hosted runners.
+    runs-on:
+      [
+        self-hosted,
+        Linux,
+        X64,
+        AEGIS,
+        "${{ needs.analyze-repository-name.outputs.env_name }}"
+      ]
+
+    steps:
+      - name: Determine ref to checkout
+        id: set-ref
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "REF=${{ inputs.tag }}" >> $GITHUB_ENV
+            echo "Triggered by workflow_call. Using tag: ${{ inputs.tag }}"
+          else
+            echo "REF=${{ github.ref }}" >> $GITHUB_ENV
+            echo "Triggered by workflow_dispatch or default. Using ref: ${{ github.ref }}"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: checkoutDir
+          ref: ${{ env.REF }}
+
+      - name: Prepare and Copy to Delivery Directory
+        env:
+          DELIVERY_DEST_S: ${{ vars.DELIVERY_DEST_S }}
+          DELIVERY_DEST_M: ${{ vars.DELIVERY_DEST_M }}
+          REPO_TYPE: ${{ needs.analyze-repository-name.outputs.repo_type }}
+          MOLECULE: ${{ needs.analyze-repository-name.outputs.molecule }}
+          STUDY_NO: ${{ needs.analyze-repository-name.outputs.study_no }}
+          REPORTING_EVENT: ${{ needs.analyze-repository-name.outputs.reporting_event }}
+        run: |
+          # 厳格モード: エラー時は即終了
+          set -euo pipefail
+          LOG_FILE="deploy_report.log"
+          START_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "========================================" > "$LOG_FILE"
+          echo "Deployment Report" >> "$LOG_FILE"
+          echo "Start Time: $START_TIME" >> "$LOG_FILE"
+
+          # 1. 配信先パスのテンプレートを選択
+          if [ "$REPO_TYPE" = "S" ]; then
+            DEST_TEMPLATE="$DELIVERY_DEST_S"
+          elif [ "$REPO_TYPE" = "M" ]; then
+            DEST_TEMPLATE="$DELIVERY_DEST_M"
+          else
+            echo "Error: Unknown repo_type: $REPO_TYPE" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # DEST_TEMPLATEが空かどうかをチェック
+          if [ -z "$DEST_TEMPLATE" ]; then
+            echo "Error: Delivery destination template (DELIVERY_DEST_S/M) is not set." | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # 2. テンプレート変数を置換
+          DEST_PATH="$DEST_TEMPLATE"
+          DEST_PATH="${DEST_PATH//<Molecule>/$MOLECULE}"
+          DEST_PATH="${DEST_PATH//<StudyNo>/$STUDY_NO}"
+          DEST_PATH="${DEST_PATH//<ReportingEventName>/$REPORTING_EVENT}"
+
+          # DEST_PATHが存在するかどうかをチェック
+          if [ ! -d "$DEST_PATH" ]; then
+            echo "Error: Destination directory does not exist: $DEST_PATH" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          echo "Target: $DEST_PATH" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+
+          # 3. .deployconfig.jsonから除外リストを読み込む
+          CONFIG_FILE="checkoutDir/.github/.deployconfig.json"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Configuration file not found: $CONFIG_FILE" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # jqがインストールされているか確認
+          if ! command -v jq &> /dev/null; then
+            echo "Error: jq is not installed. Please install jq on the runner." | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # exclude_on_deleteリストを読み込む (ファイルとディレクトリを別々に保持)
+          readarray -t DELETE_EXCLUDE_FILES < <(jq -r '.exclude_on_delete.files[]' "$CONFIG_FILE")
+          readarray -t DELETE_EXCLUDE_DIRS < <(jq -r '.exclude_on_delete.dirs[]' "$CONFIG_FILE")
+
+          # exclude_on_copyリストを読み込む (ファイルとディレクトリを別々に保持)
+          readarray -t COPY_EXCLUDE_FILES < <(jq -r '.exclude_on_copy.files[]' "$CONFIG_FILE")
+          readarray -t COPY_EXCLUDE_DIRS < <(jq -r '.exclude_on_copy.dirs[]' "$CONFIG_FILE")
+
+          echo "Deletion Exclusions (Files): ${DELETE_EXCLUDE_FILES[@]}" | tee -a "$LOG_FILE"
+          echo "Deletion Exclusions (Dirs): ${DELETE_EXCLUDE_DIRS[@]}" | tee -a "$LOG_FILE"
+          echo "Copy Exclusions (Files): ${COPY_EXCLUDE_FILES[@]}" | tee -a "$LOG_FILE"
+          echo "Copy Exclusions (Dirs): ${COPY_EXCLUDE_DIRS[@]}" | tee -a "$LOG_FILE"
+
+          # 4. 配信先ディレクトリをクリーンアップする
+          echo "Cleaning destination directory: $DEST_PATH" | tee -a "$LOG_FILE"
+          # 隠しファイル・ディレクトリ（先頭が.）も含めて全てを対象とする
+          for item in "$DEST_PATH"/.* "$DEST_PATH"/*; do
+            # グロブが展開されなかった場合はスキップ
+            if [ ! -e "$item" ]; then
+              continue
+            fi
+            item_name=$(basename "$item")
+            # . と .. はスキップ
+            if [ "$item_name" = "." ] || [ "$item_name" = ".." ]; then
+              continue
+            fi
+            should_exclude=false
+
+            # アイテムがディレクトリの場合
+            if [ -d "$item" ]; then
+              for exclude_dir in "${DELETE_EXCLUDE_DIRS[@]}"; do
+                if [[ "$item_name" == "$exclude_dir" ]]; then
+                  should_exclude=true
+                  break
+                fi
+              done
+            # アイテムがファイルの場合
+            elif [ -f "$item" ]; then
+              for exclude_file in "${DELETE_EXCLUDE_FILES[@]}"; do
+                if [[ "$item_name" == "$exclude_file" ]]; then
+                  should_exclude=true
+                  break
+                fi
+              done
+            fi
+
+            if [[ "$should_exclude" == "false" ]];
+            then
+              echo "Deleting $item" >> "$LOG_FILE"
+              rm -rf "$item"
+            else
+              echo "Skipping deletion of $item" >> "$LOG_FILE"
+            fi
+          done
+
+          # 5. checkoutDirからDEST_PATHへファイルをコピーする
+          echo "Copying files from checkoutDir to $DEST_PATH" | tee -a "$LOG_FILE"
+          rsync_exclude_opts=()
+          for exclude in "${COPY_EXCLUDE_FILES[@]}"; do
+            rsync_exclude_opts+=(--exclude "$exclude")
+          done
+          for exclude in "${COPY_EXCLUDE_DIRS[@]}"; do
+            # ディレクトリの除外には末尾にスラッシュを追加して、同名のファイルを誤って除外しないようにする
+            rsync_exclude_opts+=(--exclude "$exclude/")
+          done
+
+          # rsyncの詳細な進捗はログファイルのみに出力する
+          if ! rsync -rv --progress "${rsync_exclude_opts[@]}" checkoutDir/ "$DEST_PATH/" >> "$LOG_FILE" 2>&1; then
+            echo "Error: Failed to copy files with rsync." | tee -a "$LOG_FILE"
+            echo "▼▼▼▼▼▼▼▼▼▼ Log Details ▼▼▼▼▼▼▼▼▼▼"
+            cat "$LOG_FILE"
+            echo "▲▲▲▲▲▲▲▲▲▲ End of Log Details ▲▲▲▲▲▲▲▲▲▲"
+            exit 1
+          fi
+          echo "Copied files to $DEST_PATH." >> "$LOG_FILE"
+
+          # デフォルトACLのmaskを動的に取得
+          DEST_MASK=$(getfacl "$DEST_PATH" 2>/dev/null | awk -F: '$1=="default" && $2=="mask" {print $NF; exit}')
+          DEST_MASK=$(echo "$DEST_MASK" | tr -d '[:space:]')
+          echo "Detected default ACL mask on destination: '${DEST_MASK:-<empty>}'" | tee -a "$LOG_FILE"
+
+          # DESTのデフォルトACL maskが未設定の場合はmask再設定しない
+          if [[ -n "$DEST_MASK" ]]; then
+
+            # ファイル用mask：ディレクトリmaskから実行権限(x)を除去 例) rwx → rw-
+            FILE_MASK=$(echo "$DEST_MASK" | tr 'x' '-')
+
+            # ディレクトリのACL maskを再設定
+            #   -mindepth 1       : $DEST_PATH自身は除外（設定済みのため）
+            #   m::${DEST_MASK}   : access maskを設定        例) m::rwx
+            #   d:m::${DEST_MASK} : default maskも同時設定   例) d:m::rwx
+            #                       （将来この配下に作成される子要素へ正しく継承させるため）
+            # ファイルのACL maskを再設定
+            #   m::${FILE_MASK}   : access maskのみ設定      例) m::rw-
+            #                       （ファイルにdefault ACLは存在しないため不要）
+            #   -r (--no-run-if-empty)：入力が空の場合、コマンドを実行しない
+            # どちらかが失敗した場合はエラー処理へ
+            if ! find "$DEST_PATH" -mindepth 1 -type d -print0 \
+                   | xargs -0 -r setfacl -m "m::${DEST_MASK},d:m::${DEST_MASK}" \
+              || ! find "$DEST_PATH" -mindepth 1 -type f -print0 \
+                   | xargs -0 -r setfacl -m "m::${FILE_MASK}"; then
+              echo "Error: failed to change mask." >> "$LOG_FILE"
+              cat "$LOG_FILE"
+              echo "▲▲▲▲▲▲▲▲▲▲ End of Log Details ▲▲▲▲▲▲▲▲▲▲"
+              exit 1
+            fi
+          else
+            echo "Skipped setting ACL mask: '$DEST_PATH' has no default ACL" | tee -a "$LOG_FILE"
+          fi
+          echo "Succeeded to update mask(rwx/rw-) for deployed directories and files under $DEST_PATH." >> "$LOG_FILE"
+
+          # 6. 初回配信時のみ、配送先ルートに .Rprofile.org を作成する
+          #    二回目以降の配信では既存ファイルを維持し、再作成しない
+          if [ ! -f "$DEST_PATH/.Rprofile.org" ]; then
+            cp /mnt/sys/init/R/.Rprofile "$DEST_PATH/.Rprofile.org"
+            echo "Created initial .Rprofile.org in destination root." | tee -a "$LOG_FILE"
+          else
+            echo "Skipped creating .Rprofile.org because it already exists." | tee -a "$LOG_FILE"
+          fi
+
+          END_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "End Time: $END_TIME" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+          echo "Deployment completed successfully." | tee -a "$LOG_FILE"
+          echo " "
+          echo "▼▼▼▼▼▼▼▼▼▼ Log Details ▼▼▼▼▼▼▼▼▼▼"
+          cat "$LOG_FILE"
+          echo "▲▲▲▲▲▲▲▲▲▲ End of Log Details ▲▲▲▲▲▲▲▲▲▲"
+          echo " "
+
+          # 7. checkoutDirのクリーンアップ
+          echo "Cleaning up checkoutDir..."
+          rm -rf checkoutDir
+
+          # 8. ログファイルの削除
+          rm "$LOG_FILE"

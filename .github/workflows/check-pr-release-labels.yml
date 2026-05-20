@@ -1,0 +1,70 @@
+name: Check PR Release Labels
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+    branches:
+      - main
+
+concurrency:
+  group: check-release-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  check-release-label:
+    name: actions/check-release-label
+    # qa から main へのマージ時のみ実行
+    if: github.event.pull_request.head.ref == 'qa'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for required label
+        env:
+          # 現在の PR の全てのラベル情報を取得（JSON形式）
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          # 厳格モード: エラー時は即終了
+          set -euo pipefail
+          trap 'echo "❌ Error in Check for required label step (line $LINENO)."; exit 1' ERR
+
+          echo "Checking PR labels..."
+
+          # jq を使用してラベル名リストを抽出
+          # 注意：GitHub Runner 環境にはデフォルトで jq がインストールされています
+          LABELS=$(echo "$PR_LABELS_JSON" | jq -r '.[].name')
+
+          # 必須かつ一つだけ選択可能なラベルリストを定義
+          # "AEGIS: no-release", "AEGIS: release"
+
+          MATCH_COUNT=0
+          MATCHED_LABELS=""
+
+          # PR の各ラベルをループしてチェック
+          while IFS= read -r LABEL; do
+            if [ -z "$LABEL" ]; then continue; fi
+            
+            case "$LABEL" in
+              "AEGIS: no-release"|"AEGIS: release")
+                echo "Found valid label: $LABEL"
+                MATCH_COUNT=$((MATCH_COUNT + 1))
+                MATCHED_LABELS="$MATCHED_LABELS '$LABEL'"
+                ;;
+            esac
+          done <<< "$LABELS"
+
+          echo "----------------------------------------"
+
+          # チェックロジック：正確に1個である必要があります
+          if [ "$MATCH_COUNT" -eq 0 ]; then
+            echo "::error::Required label not detected!"
+            echo "Error: Please select exactly one of the following labels:"
+            echo " - 'AEGIS: no-release'"
+            echo " - 'AEGIS: release'"
+            exit 1
+          elif [ "$MATCH_COUNT" -gt 1 ]; then
+            echo "::error::Multiple required labels detected!"
+            echo "Error: Multiple required labels cannot be selected at the same time. Detected labels:$MATCHED_LABELS"
+            echo "Please leave only one."
+            exit 1
+          fi
+
+          echo "Check passed. Selected label:$MATCHED_LABELS"

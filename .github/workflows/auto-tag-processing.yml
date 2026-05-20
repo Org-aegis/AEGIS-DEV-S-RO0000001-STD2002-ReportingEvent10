@@ -1,0 +1,206 @@
+# ================================================
+# 機能概要
+# -----------------------------------------------
+# このワークフローは、mainブランチへのpushを契機に、
+# リポジトリ状態とPRラベルを確認してタグ作成を行い、
+# 作成されたタグを指定してデプロイワークフローを呼び出します。
+#
+# 実行条件：
+# ・mainブランチへのpush時
+#
+# 主な処理：
+# ・リポジトリ名に "template" を含む場合は処理を終了
+# ・v0.0.0タグの有無と現在コミットとの関係を確認し、リポジトリ準備状態を判定
+# ・現在コミットに紐づくPRを取得し、mainにマージ済みPRのラベルを抽出
+# ・ラベルに応じてタグ作成可否を判定（AEGIS: no-release は作成スキップ）
+# ・AEGIS: release を検知した場合、最新タグを基に新しいタグを作成
+# ・新規タグ作成時のみ Auto Deploy (Self-Hosted) ワークフローを呼び出し
+# ================================================
+
+name: Auto Tag Processing
+
+permissions:
+  contents: write # リポジトリにタグをプッシュするために必要
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  check-template:
+    runs-on: ubuntu-latest
+    outputs:
+      is_template: ${{ steps.check_template.outputs.is_template }}
+    steps:
+      - name: Check if repository is a template
+        id: check_template
+        run: |
+          repo_name="${GITHUB_REPOSITORY##*/}"
+          if echo "$repo_name" | grep -i "template" ; then
+            echo "is_template=true" >> $GITHUB_OUTPUT
+            echo "This repository is a template. Exiting."
+          else
+            echo "is_template=false" >> $GITHUB_OUTPUT
+            echo "This repository is not a template. Continuing."
+          fi
+
+  check-repo-ready:
+    runs-on: ubuntu-latest
+    needs: check-template
+    if: needs.check-template.outputs.is_template == 'false'
+    outputs:
+      repo_ready: ${{ steps.check_repo_ready.outputs.repo_ready }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check if repository is ready
+        id: check_repo_ready
+        run: |
+          TAGS=$(git tag)
+          # v0.0.0タグが存在しない場合はリポ作成未完了とみなす
+          if [ -z "$TAGS" ] || ! echo "$TAGS" | grep -q "^v0\.0\.0$"; then
+            echo "repo_ready=false" >> $GITHUB_OUTPUT
+            echo "No v0.0.0 tag found (no tags or v0.0.0 missing). Repository not ready. Exiting."
+          else
+            # v0.0.0タグのコミットSHAを取得
+            INIT_COMMIT=$(git rev-list -n 1 v0.0.0)
+            # PushイベントのコミットSHAを取得
+            CURRENT_COMMIT="${GITHUB_SHA}"
+
+            # v0.0.0が現在のコミットの祖先かどうかを確認
+            if git merge-base --is-ancestor "$INIT_COMMIT" "$CURRENT_COMMIT"; then
+              if [ "$INIT_COMMIT" = "$CURRENT_COMMIT" ]; then
+                # 現在のコミットがv0.0.0と同じ場合はリポ作成未完了とみなす
+                echo "repo_ready=false" >> $GITHUB_OUTPUT
+                echo "Current commit is v0.0.0. Repository not ready. Exiting."
+              else
+                # v0.0.0より後のコミットであればリポ作成完了とみなす
+                echo "repo_ready=true" >> $GITHUB_OUTPUT
+                echo "Repository is ready. Continuing."
+              fi
+            else
+              # v0.0.0より前のコミットの場合はリポ作成未完了とみなす
+              echo "repo_ready=false" >> $GITHUB_OUTPUT
+              echo "Current commit is before v0.0.0. Repository not ready. Exiting."
+            fi
+          fi
+
+  tag-processing:
+    runs-on: ubuntu-latest
+    needs: check-repo-ready
+    if: needs.check-repo-ready.outputs.repo_ready == 'true'
+    outputs:
+      new_tag: ${{ steps.process-labels-and-tag.outputs.new_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get related PR labels
+        id: pr_labels
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const commitSha = process.env.GITHUB_SHA;
+
+            // このコミットに関連する PR を直接取得
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: commitSha,
+              headers: {
+                "X-GitHub-Api-Version": "2026-03-10"
+              }
+            });
+
+            // main にマージされた PR を1つ選ぶ
+            const pr = prs.find(p =>
+              p.base.ref === 'main' &&
+              p.state === 'closed' &&
+              p.merged_at
+            );
+
+            if (!pr) {
+              core.info("No related PR found for this commit.");
+              core.setOutput("labels", "[]");
+              return;
+            }
+
+            const labels = pr.labels.map(l => l.name);
+            core.setOutput("labels", JSON.stringify(labels));
+            core.info(`The labels for this PR are: ${JSON.stringify(labels)}`);
+
+      - name: Process Labels and Tag
+        id: process-labels-and-tag
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const labels = JSON.parse('${{ steps.pr_labels.outputs.labels }}');
+            let bumpType = null;
+
+            // "no-release" ラベルを優先して確認
+            if (labels.includes('AEGIS: no-release')) {
+              core.info('Label "AEGIS: no-release" found. Skipping tag creation.');
+              return; // "no-release" があれば、他のラベルを問わず終了
+            }
+
+            // "release" ラベルを確認
+            if (labels.includes('AEGIS: release')) {
+              bumpType = 'major'; // "AEGIS: release" があれば major アップデート
+            }
+
+            // 適切なリリースラベルが見つからない場合は終了
+            if (!bumpType) {
+              core.info('No applicable release label found. Exiting.');
+              return;
+            }
+
+            core.info(`Bump type detected: ${bumpType}`);
+
+            // 最新のタグを取得
+            // 注: タグが時系列順（=バージョン順）に作成される前提。乱序の場合はsemverソート処理に変更が必要
+            const tags = await github.rest.repos.listTags({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 1,
+              headers: {
+                "X-GitHub-Api-Version": "2026-03-10"
+              }
+            });
+            let latestTag = tags.data.length > 0 ? tags.data[0].name : 'v0.0.0';
+            core.info(`Latest tag: ${latestTag}`);
+
+            let [major, minor, patch] = latestTag.replace(/^v/, '').split('.').map(x => parseInt(x) || 0);
+
+            // 将来の拡張のためにバージョンアップのロジックを保持
+            if (bumpType === 'major') { major++; minor = 0; patch = 0; }
+            else if (bumpType === 'minor') { minor++; patch = 0; }
+            else if (bumpType === 'patch') { patch++; }
+
+            const newTag = `v${major}.${minor}.${patch}`;
+            core.info(`New tag: ${newTag}`);
+
+            // 新しいタグを作成
+            const commitSha = process.env.GITHUB_SHA;
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${newTag}`,
+              sha: commitSha,
+              headers: {
+                "X-GitHub-Api-Version": "2026-03-10"
+              }
+            });
+            core.setOutput('new_tag', newTag);
+
+  deploy:
+    needs: tag-processing
+    if: ${{ needs.tag-processing.outputs.new_tag != '' }}
+    uses: ./.github/workflows/auto-deploy-use-selfhosted-runner.yml
+    with:
+      tag: ${{ needs.tag-processing.outputs.new_tag }}
