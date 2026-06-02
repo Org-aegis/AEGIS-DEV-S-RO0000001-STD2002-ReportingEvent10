@@ -1,3 +1,4 @@
+##
 source("renv/activate.R")
 renv_activate <- file.path(getwd(), "renv", "activate.R")
 if (file.exists(renv_activate)) {
