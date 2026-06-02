@@ -21,6 +21,7 @@ name: Auto Tag Processing
 
 permissions:
   contents: write # リポジトリにタグをプッシュするために必要
+  pull-requests: read # Added on 2026/05/23
 
 on:
   push:
@@ -96,11 +97,6 @@ jobs:
     outputs:
       new_tag: ${{ steps.process-labels-and-tag.outputs.new_tag }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
       - name: Get related PR labels
         id: pr_labels
         uses: actions/github-script@v8
@@ -138,9 +134,11 @@ jobs:
       - name: Process Labels and Tag
         id: process-labels-and-tag
         uses: actions/github-script@v8
+        env:
+          PR_LABELS_JSON: ${{ steps.pr_labels.outputs.labels }}
         with:
           script: |
-            const labels = JSON.parse('${{ steps.pr_labels.outputs.labels }}');
+            const labels = JSON.parse(process.env.PR_LABELS_JSON || '[]');
             let bumpType = null;
 
             // "no-release" ラベルを優先して確認
